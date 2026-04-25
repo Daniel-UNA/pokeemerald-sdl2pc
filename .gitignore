@@ -38,3 +38,5 @@ prefabs.json
 *.diff
 *.sym
 *.js
+SDL2-2.30.8/
+SDL2.dll

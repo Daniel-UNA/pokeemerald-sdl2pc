@@ -31,7 +31,6 @@ SDL_sem *vBlankSemaphore;
 SDL_atomic_t isFrameAvailable;
 bool speedUp = false;
 unsigned int videoScale = 1;
-bool videoScaleChanged = false;
 bool isRunning = true;
 bool paused = false;
 double simTime = 0;
@@ -173,12 +172,6 @@ int main(int argc, char **argv)
                     accumulator -= dt;
                 }
             }
-        }
-
-        if (videoScaleChanged)
-        {
-            SDL_SetWindowSize(sdlWindow, DISPLAY_WIDTH * videoScale, DISPLAY_HEIGHT * videoScale);
-            videoScaleChanged = false;
         }
 
         SDL_RenderPresent(sdlRenderer);
@@ -356,23 +349,6 @@ void ProcessEvents(void)
                     SDL_PauseAudio(1);
                 }
                 break;
-            }
-            break;
-        case SDL_WINDOWEVENT:
-            if (event.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)
-            {
-                unsigned int w = event.window.data1;
-                unsigned int h = event.window.data2;
-                
-                videoScale = 0;
-                if (w / DISPLAY_WIDTH > videoScale)
-                    videoScale = w / DISPLAY_WIDTH;
-                if (h / DISPLAY_HEIGHT > videoScale)
-                    videoScale = h / DISPLAY_HEIGHT;
-                if (videoScale < 1)
-                    videoScale = 1;
-
-                videoScaleChanged = true;
             }
             break;
         }
