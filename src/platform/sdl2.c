@@ -2,6 +2,8 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #ifdef _WIN32
@@ -10,6 +12,7 @@
 #endif
 
 #include <SDL2/SDL.h>
+#include <SDL2/SDL_opengl.h>
 
 #include "global.h"
 #include "platform.h"
@@ -27,18 +30,78 @@ SDL_Thread *mainLoopThread;
 SDL_Window *sdlWindow;
 SDL_Renderer *sdlRenderer;
 SDL_Texture *sdlTexture;
+SDL_GLContext sdlGlContext;
 SDL_sem *vBlankSemaphore;
 SDL_atomic_t isFrameAvailable;
 bool speedUp = false;
 unsigned int videoScale = 1;
 bool isRunning = true;
 bool paused = false;
+bool useShaderPipeline = false;
+bool audioOutputReady = false;
+float audioVolume = 1.0f;
+int audioSourceSampleRate = 42048;
+int audioRequestedSampleRate = 42048;
+int audioDeviceSampleRate = 42048;
+SDL_AudioDeviceID audioDeviceId = 0;
+SDL_AudioStream *audioStream = NULL;
+float *audioVolumeBuffer = NULL;
+size_t audioVolumeBufferFloats = 0;
+Uint8 *audioOutputBuffer = NULL;
+size_t audioOutputBufferBytes = 0;
 double simTime = 0;
 double lastGameTime = 0;
 double curGameTime = 0;
 double fixedTimestep = 1.0 / 60.0; // 16.666667ms
 double timeScale = 1.0;
+GLuint glProgram = 0;
+GLuint glFrameTexture = 0;
+GLint glMainTextureUniform = -1;
+GLint glRenderResolutionUniform = -1;
+GLint glSourceResolutionUniform = -1;
+GLint glOutputResolutionUniform = -1;
+GLint glTimeUniform = -1;
+GLint glFrameUniform = -1;
+GLint glScaleUniform = -1;
+GLint glAudioVolumeUniform = -1;
+GLint glSpeedUniform = -1;
+Uint32 shaderStartTicks = 0;
+int shaderFrameCounter = 0;
+char fragmentShaderPath[260] = "shaders/upscale.frag";
 struct SiiRtcInfo internalClock;
+static bool showVolumeNotice = false;
+static Uint32 volumeNoticeUntil = 0;
+static char volumeNoticeText[32] = {0};
+
+struct PcConfig
+{
+    bool enableShader;
+    unsigned int windowScale;
+    char shaderPath[260];
+    bool enableAudio;
+    int audioSampleRate;
+    unsigned int audioBufferSamples;
+    float audioVolume;
+};
+
+static PFNGLCREATESHADERPROC pglCreateShader;
+static PFNGLSHADERSOURCEPROC pglShaderSource;
+static PFNGLCOMPILESHADERPROC pglCompileShader;
+static PFNGLGETSHADERIVPROC pglGetShaderiv;
+static PFNGLGETSHADERINFOLOGPROC pglGetShaderInfoLog;
+static PFNGLDELETESHADERPROC pglDeleteShader;
+static PFNGLCREATEPROGRAMPROC pglCreateProgram;
+static PFNGLATTACHSHADERPROC pglAttachShader;
+static PFNGLLINKPROGRAMPROC pglLinkProgram;
+static PFNGLGETPROGRAMIVPROC pglGetProgramiv;
+static PFNGLGETPROGRAMINFOLOGPROC pglGetProgramInfoLog;
+static PFNGLUSEPROGRAMPROC pglUseProgram;
+static PFNGLDELETEPROGRAMPROC pglDeleteProgram;
+static PFNGLGETUNIFORMLOCATIONPROC pglGetUniformLocation;
+static PFNGLUNIFORM1IPROC pglUniform1i;
+static PFNGLUNIFORM1FPROC pglUniform1f;
+static PFNGLUNIFORM2FPROC pglUniform2f;
+static PFNGLACTIVETEXTUREPROC pglActiveTexture;
 
 static FILE *sSaveFile = NULL;
 
@@ -54,15 +117,60 @@ static void StoreSaveFile(void);
 static void CloseSaveFile(void);
 
 static void UpdateInternalClock(void);
+static bool TryInitShaderPipeline(void);
+static void ShutdownShaderPipeline(void);
+static void RenderFrameWithShader(void);
+static bool ShaderFileExists(const char *path);
+static bool LoadShaderApi(void);
+static GLuint CompileShader(GLenum type, const char *source, const char *label);
+static char *LoadTextFile(const char *path);
+static void LoadPcConfig(const char *path, struct PcConfig *config);
+static char *TrimWhitespace(char *text);
+static bool ParseBoolValue(const char *value, bool defaultValue);
+static void ShowVolumeNotice(float volume);
+static void AdjustAudioVolume(float delta);
+static void DrawVolumeOverlay(uint16_t *pixels);
+static void DrawOverlayBox(uint16_t *pixels, int x, int y, int w, int h, uint16_t color);
+static const uint8_t *GetOverlayGlyph(char ch);
+static void DrawOverlayChar(uint16_t *pixels, int x, int y, char ch, uint16_t color);
+static int OverlayTextWidth(const char *text);
+static void DrawOverlayText(uint16_t *pixels, int x, int y, const char *text, uint16_t color);
+
+#define RGB555(r, g, b) ((uint16_t)((r) | ((g) << 5) | ((b) << 10)))
+#define RGB555_WHITE RGB555(31, 31, 31)
 
 int main(int argc, char **argv)
 {
+    Uint32 windowFlags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
+    const char *shaderEnv;
+    const char *windowScaleEnv;
+    bool shaderRequested;
+    bool shaderFilePresent;
+    struct PcConfig config;
+
     // Open an output console on Windows
 #ifdef _WIN32
     AllocConsole() ;
     AttachConsole( GetCurrentProcessId() ) ;
     freopen( "CON", "w", stdout ) ;
 #endif
+
+    config.enableShader = false;
+    config.windowScale = 1;
+    strncpy(config.shaderPath, fragmentShaderPath, sizeof(config.shaderPath) - 1);
+    config.shaderPath[sizeof(config.shaderPath) - 1] = '\0';
+    config.enableAudio = true;
+    config.audioSampleRate = 42048;
+    config.audioBufferSamples = 1024;
+    config.audioVolume = 1.0f;
+    LoadPcConfig("pc_config.ini", &config);
+    audioSourceSampleRate = 42048;
+    audioRequestedSampleRate = config.audioSampleRate;
+    audioVolume = config.audioVolume;
+
+    videoScale = config.windowScale;
+    strncpy(fragmentShaderPath, config.shaderPath, sizeof(fragmentShaderPath) - 1);
+    fragmentShaderPath[sizeof(fragmentShaderPath) - 1] = '\0';
 
     ReadSaveFile("pokeemerald.sav");
 
@@ -72,33 +180,63 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    sdlWindow = SDL_CreateWindow("pokeemerald", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, DISPLAY_WIDTH * videoScale, DISPLAY_HEIGHT * videoScale, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+    shaderEnv = SDL_getenv("POKEEMERALD_ENABLE_SHADER");
+    shaderRequested = config.enableShader;
+    if (shaderEnv != NULL)
+        shaderRequested = ParseBoolValue(shaderEnv, shaderRequested);
+
+    windowScaleEnv = SDL_getenv("POKEEMERALD_WINDOW_SCALE");
+    if (windowScaleEnv != NULL)
+    {
+        unsigned int envScale = (unsigned int)strtoul(windowScaleEnv, NULL, 10);
+        if (envScale >= 1 && envScale <= 10)
+            videoScale = envScale;
+    }
+
+    shaderFilePresent = ShaderFileExists(fragmentShaderPath);
+    if (shaderRequested && shaderFilePresent)
+        windowFlags |= SDL_WINDOW_OPENGL;
+
+    sdlWindow = SDL_CreateWindow("pokeemerald", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, DISPLAY_WIDTH * videoScale, DISPLAY_HEIGHT * videoScale, windowFlags);
     if (sdlWindow == NULL)
     {
         DBGPRINTF("Window could not be created! SDL_Error: %s\n", SDL_GetError());
         return 1;
     }
 
-    sdlRenderer = SDL_CreateRenderer(sdlWindow, -1, SDL_RENDERER_PRESENTVSYNC);
-    if (sdlRenderer == NULL)
+    if (shaderRequested && shaderFilePresent && TryInitShaderPipeline())
     {
-        DBGPRINTF("Renderer could not be created! SDL_Error: %s\n", SDL_GetError());
-        return 1;
+        useShaderPipeline = true;
+        DBGPRINTF("Using OpenGL shader pipeline (%s)\n", fragmentShaderPath);
     }
-
-    SDL_SetRenderDrawColor(sdlRenderer, 255, 255, 255, 255);
-    SDL_RenderClear(sdlRenderer);
-    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
-    SDL_RenderSetLogicalSize(sdlRenderer, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-
-    sdlTexture = SDL_CreateTexture(sdlRenderer,
-                                   SDL_PIXELFORMAT_ABGR1555,
-                                   SDL_TEXTUREACCESS_STREAMING,
-                                   DISPLAY_WIDTH, DISPLAY_HEIGHT);
-    if (sdlTexture == NULL)
+    else
     {
-        DBGPRINTF("Texture could not be created! SDL_Error: %s\n", SDL_GetError());
-        return 1;
+        if (shaderRequested && !shaderFilePresent)
+            DBGPRINTF("Shader requested but file '%s' was not found. Using nearest fallback.\n", fragmentShaderPath);
+
+        sdlRenderer = SDL_CreateRenderer(sdlWindow, -1, SDL_RENDERER_PRESENTVSYNC);
+        if (sdlRenderer == NULL)
+        {
+            DBGPRINTF("Renderer could not be created! SDL_Error: %s\n", SDL_GetError());
+            return 1;
+        }
+
+        SDL_SetRenderDrawColor(sdlRenderer, 255, 255, 255, 255);
+        SDL_RenderClear(sdlRenderer);
+        SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
+        SDL_RenderSetLogicalSize(sdlRenderer, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+
+        sdlTexture = SDL_CreateTexture(sdlRenderer,
+                                       SDL_PIXELFORMAT_ABGR1555,
+                                       SDL_TEXTUREACCESS_STREAMING,
+                                       DISPLAY_WIDTH, DISPLAY_HEIGHT);
+        if (sdlTexture == NULL)
+        {
+            DBGPRINTF("Texture could not be created! SDL_Error: %s\n", SDL_GetError());
+            return 1;
+        }
+
+        DBGPRINTF("Using SDL nearest fallback pipeline\n");
     }
 
     simTime = curGameTime = lastGameTime = SDL_GetPerformanceCounter();
@@ -107,22 +245,54 @@ int main(int argc, char **argv)
     vBlankSemaphore = SDL_CreateSemaphore(0);
 
     SDL_AudioSpec want;
+    SDL_AudioSpec have;
 
     SDL_memset(&want, 0, sizeof(want)); /* or SDL_zero(want) */
-    want.freq = 42048;
+    want.freq = audioRequestedSampleRate;
     want.format = AUDIO_F32;
     want.channels = 2;
-    want.samples = 1024;
-    cgb_audio_init(want.freq);
+    want.samples = config.audioBufferSamples;
+    cgb_audio_init(audioSourceSampleRate);
 
-
-    if (SDL_OpenAudio(&want, 0) < 0)
-        SDL_Log("Failed to open audio: %s", SDL_GetError());
+    if (config.enableAudio)
+    {
+        SDL_SetHint(SDL_HINT_AUDIO_RESAMPLING_MODE, "best");
+        audioDeviceId = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+        if (audioDeviceId == 0)
+        {
+            SDL_Log("Failed to open audio: %s", SDL_GetError());
+            audioOutputReady = false;
+        }
+        else
+        {
+            audioDeviceSampleRate = have.freq;
+            if (audioDeviceSampleRate != audioRequestedSampleRate)
+            {
+                SDL_Log("Requested audio rate %d Hz, got %d Hz", audioRequestedSampleRate, audioDeviceSampleRate);
+            }
+            if (audioDeviceSampleRate != audioSourceSampleRate)
+            {
+                SDL_Log("Audio resampling enabled: %d Hz -> %d Hz", audioSourceSampleRate, audioDeviceSampleRate);
+            }
+            audioStream = SDL_NewAudioStream(AUDIO_F32, 2, audioSourceSampleRate, have.format, have.channels, have.freq);
+            if (audioStream == NULL)
+            {
+                SDL_Log("Failed to create audio stream: %s", SDL_GetError());
+                SDL_CloseAudioDevice(audioDeviceId);
+                audioDeviceId = 0;
+                audioOutputReady = false;
+            }
+            else
+            {
+                SDL_PauseAudioDevice(audioDeviceId, 0);
+                audioOutputReady = true;
+            }
+        }
+    }
     else
     {
-        if (want.format != AUDIO_F32) /* we let this one thing change. */
-            SDL_Log("We didn't get Float32 audio format.");
-        SDL_PauseAudio(0);
+        SDL_Log("Audio disabled by pc_config.ini");
+        audioOutputReady = false;
     }
     
     VDraw(sdlTexture);
@@ -155,8 +325,15 @@ int main(int argc, char **argv)
                 if (SDL_AtomicGet(&isFrameAvailable))
                 {
                     VDraw(sdlTexture);
-                    SDL_RenderClear(sdlRenderer);
-                    SDL_RenderCopy(sdlRenderer, sdlTexture, NULL, NULL);
+                    if (useShaderPipeline)
+                    {
+                        RenderFrameWithShader();
+                    }
+                    else
+                    {
+                        SDL_RenderClear(sdlRenderer);
+                        SDL_RenderCopy(sdlRenderer, sdlTexture, NULL, NULL);
+                    }
                     SDL_AtomicSet(&isFrameAvailable, 0);
 
                     REG_DISPSTAT |= INTR_FLAG_VBLANK;
@@ -174,12 +351,37 @@ int main(int argc, char **argv)
             }
         }
 
-        SDL_RenderPresent(sdlRenderer);
+        if (useShaderPipeline)
+            SDL_GL_SwapWindow(sdlWindow);
+        else
+            SDL_RenderPresent(sdlRenderer);
     }
 
     //StoreSaveFile();
     CloseSaveFile();
 
+    if (audioStream != NULL)
+    {
+        SDL_FreeAudioStream(audioStream);
+        audioStream = NULL;
+    }
+    if (audioDeviceId != 0)
+    {
+        SDL_CloseAudioDevice(audioDeviceId);
+        audioDeviceId = 0;
+    }
+    free(audioVolumeBuffer);
+    audioVolumeBuffer = NULL;
+    audioVolumeBufferFloats = 0;
+    free(audioOutputBuffer);
+    audioOutputBuffer = NULL;
+    audioOutputBufferBytes = 0;
+
+    if (sdlTexture != NULL)
+        SDL_DestroyTexture(sdlTexture);
+    if (sdlRenderer != NULL)
+        SDL_DestroyRenderer(sdlRenderer);
+    ShutdownShaderPipeline();
     SDL_DestroyWindow(sdlWindow);
     SDL_Quit();
     return 0;
@@ -249,7 +451,79 @@ void Platform_ReadFlash(u16 sectorNum, u32 offset, u8 *dest, u32 size)
 
 void Platform_QueueAudio(float *audioBuffer, s32 samplesPerFrame)
 {
-    SDL_QueueAudio(1, audioBuffer, samplesPerFrame);
+    if (!audioOutputReady || audioDeviceId == 0 || audioStream == NULL)
+        return;
+
+    s32 inputFloatCount = samplesPerFrame / (s32)sizeof(float);
+
+    if (inputFloatCount <= 0)
+        return;
+
+    size_t requiredBytes = (size_t)inputFloatCount * sizeof(float);
+    if (audioVolumeBufferFloats < (size_t)inputFloatCount)
+    {
+        float *newBuffer = realloc(audioVolumeBuffer, requiredBytes);
+        if (newBuffer == NULL)
+        {
+            SDL_Log("Audio volume buffer allocation failed");
+            return;
+        }
+
+        audioVolumeBuffer = newBuffer;
+        audioVolumeBufferFloats = (size_t)inputFloatCount;
+    }
+
+    float *sourceBuffer = audioBuffer;
+    if (audioVolume != 1.0f)
+    {
+        for (s32 i = 0; i < inputFloatCount; i++)
+        {
+            float scaled = audioBuffer[i] * audioVolume;
+            if (scaled > 1.0f)
+                scaled = 1.0f;
+            else if (scaled < -1.0f)
+                scaled = -1.0f;
+            audioVolumeBuffer[i] = scaled;
+        }
+
+        sourceBuffer = audioVolumeBuffer;
+    }
+
+    if (SDL_AudioStreamPut(audioStream, sourceBuffer, requiredBytes) < 0)
+    {
+        SDL_Log("SDL_AudioStreamPut failed: %s", SDL_GetError());
+        return;
+    }
+
+    int availableBytes = SDL_AudioStreamAvailable(audioStream);
+    while (availableBytes > 0)
+    {
+        size_t chunkBytes = (size_t)availableBytes;
+        if (audioOutputBufferBytes < chunkBytes)
+        {
+            Uint8 *newBuffer = realloc(audioOutputBuffer, chunkBytes);
+            if (newBuffer == NULL)
+            {
+                SDL_Log("Audio output buffer allocation failed");
+                return;
+            }
+
+            audioOutputBuffer = newBuffer;
+            audioOutputBufferBytes = chunkBytes;
+        }
+
+        int bytesWritten = SDL_AudioStreamGet(audioStream, audioOutputBuffer, (int)chunkBytes);
+        if (bytesWritten < 0)
+        {
+            SDL_Log("SDL_AudioStreamGet failed: %s", SDL_GetError());
+            return;
+        }
+
+        if (bytesWritten > 0)
+            SDL_QueueAudio(audioDeviceId, audioOutputBuffer, (Uint32)bytesWritten);
+
+        availableBytes = SDL_AudioStreamAvailable(audioStream);
+    }
 }
 
 
@@ -310,9 +584,20 @@ void ProcessEvents(void)
                 {
                     speedUp = false;
                     timeScale = 1.0;
-                    SDL_ClearQueuedAudio(1);
-                    SDL_PauseAudio(0);
+                    if (audioOutputReady)
+                    {
+                        SDL_ClearQueuedAudio(audioDeviceId);
+                        SDL_PauseAudioDevice(audioDeviceId, 0);
+                    }
                 }
+                break;
+            case SDLK_MINUS:
+            case SDLK_KP_MINUS:
+                AdjustAudioVolume(-0.1f);
+                break;
+            case SDLK_EQUALS:
+            case SDLK_KP_PLUS:
+                AdjustAudioVolume(0.1f);
                 break;
             }
             break;
@@ -346,8 +631,19 @@ void ProcessEvents(void)
                 {
                     speedUp = true;
                     timeScale = 5.0;
-                    SDL_PauseAudio(1);
+                    if (audioOutputReady)
+                        SDL_PauseAudioDevice(audioDeviceId, 1);
                 }
+                break;
+            case SDLK_MINUS:
+            case SDLK_KP_MINUS:
+                if (!event.key.repeat)
+                    AdjustAudioVolume(-0.1f);
+                break;
+            case SDLK_EQUALS:
+            case SDLK_KP_PLUS:
+                if (!event.key.repeat)
+                    AdjustAudioVolume(0.1f);
                 break;
             }
             break;
@@ -398,12 +694,16 @@ u16 GetXInputKeys()
         {
             if (timeScale > 1.0)
             {
-                SDL_PauseAudio(1);
+                if (audioOutputReady)
+                    SDL_PauseAudioDevice(audioDeviceId, 1);
             }
             else
             {
-                SDL_ClearQueuedAudio(1);
-                SDL_PauseAudio(0);
+                if (audioOutputReady)
+                {
+                    SDL_ClearQueuedAudio(audioDeviceId);
+                    SDL_PauseAudioDevice(audioDeviceId, 0);
+                }
             }
         }
     }
@@ -428,13 +728,433 @@ void VDraw(SDL_Texture *texture)
 
     memset(image, 0, sizeof(image));
     DrawFrame(image);
-    SDL_UpdateTexture(texture, NULL, image, DISPLAY_WIDTH * sizeof (Uint16));
+    DrawVolumeOverlay(image);
+
+    if (useShaderPipeline)
+    {
+        glBindTexture(GL_TEXTURE_2D, glFrameTexture);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, image);
+    }
+    else
+    {
+        SDL_UpdateTexture(texture, NULL, image, DISPLAY_WIDTH * sizeof(Uint16));
+    }
+
     REG_VCOUNT = 161; // prep for being in VBlank period
+}
+
+static bool ShaderFileExists(const char *path)
+{
+    FILE *file = fopen(path, "rb");
+    if (file == NULL)
+        return false;
+
+    fclose(file);
+    return true;
+}
+
+static char *LoadTextFile(const char *path)
+{
+    FILE *file = fopen(path, "rb");
+    char *buffer;
+    long size;
+
+    if (file == NULL)
+        return NULL;
+
+    fseek(file, 0, SEEK_END);
+    size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    if (size <= 0)
+    {
+        fclose(file);
+        return NULL;
+    }
+
+    buffer = malloc((size_t)size + 1);
+    if (buffer == NULL)
+    {
+        fclose(file);
+        return NULL;
+    }
+
+    if (fread(buffer, 1, (size_t)size, file) != (size_t)size)
+    {
+        free(buffer);
+        fclose(file);
+        return NULL;
+    }
+
+    buffer[size] = '\0';
+    fclose(file);
+    return buffer;
+}
+
+static bool LoadShaderApi(void)
+{
+    pglCreateShader = (PFNGLCREATESHADERPROC)SDL_GL_GetProcAddress("glCreateShader");
+    pglShaderSource = (PFNGLSHADERSOURCEPROC)SDL_GL_GetProcAddress("glShaderSource");
+    pglCompileShader = (PFNGLCOMPILESHADERPROC)SDL_GL_GetProcAddress("glCompileShader");
+    pglGetShaderiv = (PFNGLGETSHADERIVPROC)SDL_GL_GetProcAddress("glGetShaderiv");
+    pglGetShaderInfoLog = (PFNGLGETSHADERINFOLOGPROC)SDL_GL_GetProcAddress("glGetShaderInfoLog");
+    pglDeleteShader = (PFNGLDELETESHADERPROC)SDL_GL_GetProcAddress("glDeleteShader");
+    pglCreateProgram = (PFNGLCREATEPROGRAMPROC)SDL_GL_GetProcAddress("glCreateProgram");
+    pglAttachShader = (PFNGLATTACHSHADERPROC)SDL_GL_GetProcAddress("glAttachShader");
+    pglLinkProgram = (PFNGLLINKPROGRAMPROC)SDL_GL_GetProcAddress("glLinkProgram");
+    pglGetProgramiv = (PFNGLGETPROGRAMIVPROC)SDL_GL_GetProcAddress("glGetProgramiv");
+    pglGetProgramInfoLog = (PFNGLGETPROGRAMINFOLOGPROC)SDL_GL_GetProcAddress("glGetProgramInfoLog");
+    pglUseProgram = (PFNGLUSEPROGRAMPROC)SDL_GL_GetProcAddress("glUseProgram");
+    pglDeleteProgram = (PFNGLDELETEPROGRAMPROC)SDL_GL_GetProcAddress("glDeleteProgram");
+    pglGetUniformLocation = (PFNGLGETUNIFORMLOCATIONPROC)SDL_GL_GetProcAddress("glGetUniformLocation");
+    pglUniform1i = (PFNGLUNIFORM1IPROC)SDL_GL_GetProcAddress("glUniform1i");
+    pglUniform1f = (PFNGLUNIFORM1FPROC)SDL_GL_GetProcAddress("glUniform1f");
+    pglUniform2f = (PFNGLUNIFORM2FPROC)SDL_GL_GetProcAddress("glUniform2f");
+    pglActiveTexture = (PFNGLACTIVETEXTUREPROC)SDL_GL_GetProcAddress("glActiveTexture");
+
+    return pglCreateShader != NULL
+        && pglShaderSource != NULL
+        && pglCompileShader != NULL
+        && pglGetShaderiv != NULL
+        && pglGetShaderInfoLog != NULL
+        && pglDeleteShader != NULL
+        && pglCreateProgram != NULL
+        && pglAttachShader != NULL
+        && pglLinkProgram != NULL
+        && pglGetProgramiv != NULL
+        && pglGetProgramInfoLog != NULL
+        && pglUseProgram != NULL
+        && pglDeleteProgram != NULL
+        && pglGetUniformLocation != NULL
+        && pglUniform1i != NULL
+        && pglUniform1f != NULL
+        && pglUniform2f != NULL
+        && pglActiveTexture != NULL;
+}
+
+static GLuint CompileShader(GLenum type, const char *source, const char *label)
+{
+    GLint status = 0;
+    GLuint shader = pglCreateShader(type);
+    if (shader == 0)
+        return 0;
+
+    pglShaderSource(shader, 1, &source, NULL);
+    pglCompileShader(shader);
+    pglGetShaderiv(shader, GL_COMPILE_STATUS, &status);
+    if (status == GL_FALSE)
+    {
+        char logBuffer[1024];
+        pglGetShaderInfoLog(shader, sizeof(logBuffer), NULL, logBuffer);
+        DBGPRINTF("%s compile error: %s\n", label, logBuffer);
+        pglDeleteShader(shader);
+        return 0;
+    }
+
+    return shader;
+}
+
+static bool TryInitShaderPipeline(void)
+{
+    static const char *vertexSource =
+        "#version 120\n"
+        "varying vec2 vTexCoord;\n"
+        "void main()\n"
+        "{\n"
+        "    vTexCoord = gl_MultiTexCoord0.xy;\n"
+        "    gl_Position = gl_Vertex;\n"
+        "}\n";
+    GLint linkStatus = 0;
+    GLuint vertexShader;
+    GLuint fragmentShader;
+    char *fragmentSource;
+
+    if (!ShaderFileExists(fragmentShaderPath))
+    {
+        DBGPRINTF("Shader file not found at '%s', falling back to nearest\n", fragmentShaderPath);
+        return false;
+    }
+
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
+
+    sdlGlContext = SDL_GL_CreateContext(sdlWindow);
+    if (sdlGlContext == NULL)
+    {
+        DBGPRINTF("Failed to create GL context: %s\n", SDL_GetError());
+        return false;
+    }
+
+    if (!LoadShaderApi())
+    {
+        DBGPRINTF("Required GL shader API unavailable, falling back to nearest\n");
+        ShutdownShaderPipeline();
+        return false;
+    }
+
+    fragmentSource = LoadTextFile(fragmentShaderPath);
+    if (fragmentSource == NULL)
+    {
+        DBGPRINTF("Could not read shader file '%s'\n", fragmentShaderPath);
+        ShutdownShaderPipeline();
+        return false;
+    }
+
+    vertexShader = CompileShader(GL_VERTEX_SHADER, vertexSource, "Vertex shader");
+    fragmentShader = CompileShader(GL_FRAGMENT_SHADER, fragmentSource, "Fragment shader");
+    free(fragmentSource);
+    if (vertexShader == 0 || fragmentShader == 0)
+    {
+        if (vertexShader != 0)
+            pglDeleteShader(vertexShader);
+        if (fragmentShader != 0)
+            pglDeleteShader(fragmentShader);
+        ShutdownShaderPipeline();
+        return false;
+    }
+
+    glProgram = pglCreateProgram();
+    if (glProgram == 0)
+    {
+        pglDeleteShader(vertexShader);
+        pglDeleteShader(fragmentShader);
+        ShutdownShaderPipeline();
+        return false;
+    }
+
+    pglAttachShader(glProgram, vertexShader);
+    pglAttachShader(glProgram, fragmentShader);
+    pglLinkProgram(glProgram);
+    pglGetProgramiv(glProgram, GL_LINK_STATUS, &linkStatus);
+    pglDeleteShader(vertexShader);
+    pglDeleteShader(fragmentShader);
+    if (linkStatus == GL_FALSE)
+    {
+        char logBuffer[1024];
+        pglGetProgramInfoLog(glProgram, sizeof(logBuffer), NULL, logBuffer);
+        DBGPRINTF("Shader link error: %s\n", logBuffer);
+        ShutdownShaderPipeline();
+        return false;
+    }
+
+    glMainTextureUniform = pglGetUniformLocation(glProgram, "uMainTex");
+    glRenderResolutionUniform = pglGetUniformLocation(glProgram, "uRenderResolution");
+    glSourceResolutionUniform = pglGetUniformLocation(glProgram, "uSourceResolution");
+    glOutputResolutionUniform = pglGetUniformLocation(glProgram, "uOutputResolution");
+    glTimeUniform = pglGetUniformLocation(glProgram, "uTime");
+    glFrameUniform = pglGetUniformLocation(glProgram, "uFrame");
+    glScaleUniform = pglGetUniformLocation(glProgram, "uScale");
+    glAudioVolumeUniform = pglGetUniformLocation(glProgram, "uAudioVolume");
+    glSpeedUniform = pglGetUniformLocation(glProgram, "uSpeed");
+
+    glGenTextures(1, &glFrameTexture);
+    glBindTexture(GL_TEXTURE_2D, glFrameTexture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB5_A1, DISPLAY_WIDTH, DISPLAY_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, NULL);
+
+    if (glMainTextureUniform >= 0)
+    {
+        pglUseProgram(glProgram);
+        pglUniform1i(glMainTextureUniform, 0);
+        pglUseProgram(0);
+    }
+
+    shaderStartTicks = SDL_GetTicks();
+    shaderFrameCounter = 0;
+
+    SDL_GL_SetSwapInterval(1);
+    return true;
+}
+
+static void RenderFrameWithShader(void)
+{
+    int windowW;
+    int windowH;
+    float scaleX;
+    float scaleY;
+    float elapsedSeconds;
+
+    SDL_GetWindowSize(sdlWindow, &windowW, &windowH);
+    glViewport(0, 0, windowW, windowH);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    pglUseProgram(glProgram);
+    pglActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, glFrameTexture);
+
+    scaleX = (float)windowW / (float)DISPLAY_WIDTH;
+    scaleY = (float)windowH / (float)DISPLAY_HEIGHT;
+    elapsedSeconds = (float)(SDL_GetTicks() - shaderStartTicks) * 0.001f;
+
+    if (glRenderResolutionUniform >= 0)
+        pglUniform2f(glRenderResolutionUniform, (float)windowW, (float)windowH);
+    if (glSourceResolutionUniform >= 0)
+        pglUniform2f(glSourceResolutionUniform, (float)DISPLAY_WIDTH, (float)DISPLAY_HEIGHT);
+    if (glOutputResolutionUniform >= 0)
+        pglUniform2f(glOutputResolutionUniform, (float)windowW, (float)windowH);
+    if (glTimeUniform >= 0)
+        pglUniform1f(glTimeUniform, elapsedSeconds);
+    if (glFrameUniform >= 0)
+        pglUniform1i(glFrameUniform, shaderFrameCounter);
+    if (glScaleUniform >= 0)
+        pglUniform2f(glScaleUniform, scaleX, scaleY);
+    if (glAudioVolumeUniform >= 0)
+        pglUniform1f(glAudioVolumeUniform, audioVolume);
+    if (glSpeedUniform >= 0)
+        pglUniform1f(glSpeedUniform, (float)timeScale);
+
+    glEnable(GL_TEXTURE_2D);
+    glBegin(GL_QUADS);
+    glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f, -1.0f);
+    glTexCoord2f(1.0f, 1.0f); glVertex2f(1.0f, -1.0f);
+    glTexCoord2f(1.0f, 0.0f); glVertex2f(1.0f, 1.0f);
+    glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f, 1.0f);
+    glEnd();
+    glDisable(GL_TEXTURE_2D);
+
+    pglUseProgram(0);
+    shaderFrameCounter++;
+}
+
+static void ShutdownShaderPipeline(void)
+{
+    if (glFrameTexture != 0)
+    {
+        glDeleteTextures(1, &glFrameTexture);
+        glFrameTexture = 0;
+    }
+
+    if (glProgram != 0)
+    {
+        pglDeleteProgram(glProgram);
+        glProgram = 0;
+    }
+
+    glMainTextureUniform = -1;
+    glRenderResolutionUniform = -1;
+    glSourceResolutionUniform = -1;
+    glOutputResolutionUniform = -1;
+    glTimeUniform = -1;
+    glFrameUniform = -1;
+    glScaleUniform = -1;
+    glAudioVolumeUniform = -1;
+    glSpeedUniform = -1;
+    shaderStartTicks = 0;
+    shaderFrameCounter = 0;
+
+    if (sdlGlContext != NULL)
+    {
+        SDL_GL_DeleteContext(sdlGlContext);
+        sdlGlContext = NULL;
+    }
 }
 
 int DoMain(void *data)
 {
     AgbMain();
+}
+
+static char *TrimWhitespace(char *text)
+{
+    char *end;
+
+    while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n')
+        text++;
+
+    if (*text == '\0')
+        return text;
+
+    end = text + strlen(text) - 1;
+    while (end > text && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n'))
+    {
+        *end = '\0';
+        end--;
+    }
+
+    return text;
+}
+
+static bool ParseBoolValue(const char *value, bool defaultValue)
+{
+    if (SDL_strcasecmp(value, "1") == 0 || SDL_strcasecmp(value, "true") == 0 || SDL_strcasecmp(value, "yes") == 0 || SDL_strcasecmp(value, "on") == 0)
+        return true;
+
+    if (SDL_strcasecmp(value, "0") == 0 || SDL_strcasecmp(value, "false") == 0 || SDL_strcasecmp(value, "no") == 0 || SDL_strcasecmp(value, "off") == 0)
+        return false;
+
+    return defaultValue;
+}
+
+static void LoadPcConfig(const char *path, struct PcConfig *config)
+{
+    FILE *file = fopen(path, "rb");
+    char line[512];
+
+    if (file == NULL)
+        return;
+
+    while (fgets(line, sizeof(line), file) != NULL)
+    {
+        char *trimmed = TrimWhitespace(line);
+        char *equals;
+        char *key;
+        char *value;
+
+        if (*trimmed == '\0' || *trimmed == '#' || *trimmed == ';')
+            continue;
+
+        equals = strchr(trimmed, '=');
+        if (equals == NULL)
+            continue;
+
+        *equals = '\0';
+        key = TrimWhitespace(trimmed);
+        value = TrimWhitespace(equals + 1);
+
+        if (SDL_strcasecmp(key, "enable_shader") == 0)
+        {
+            config->enableShader = ParseBoolValue(value, config->enableShader);
+        }
+        else if (SDL_strcasecmp(key, "window_scale") == 0)
+        {
+            unsigned int parsedScale = (unsigned int)strtoul(value, NULL, 10);
+            if (parsedScale >= 1 && parsedScale <= 10)
+                config->windowScale = parsedScale;
+        }
+        else if (SDL_strcasecmp(key, "shader_path") == 0)
+        {
+            strncpy(config->shaderPath, value, sizeof(config->shaderPath) - 1);
+            config->shaderPath[sizeof(config->shaderPath) - 1] = '\0';
+        }
+        else if (SDL_strcasecmp(key, "enable_audio") == 0)
+        {
+            config->enableAudio = ParseBoolValue(value, config->enableAudio);
+        }
+        else if (SDL_strcasecmp(key, "audio_sample_rate") == 0)
+        {
+            long parsedRate = strtol(value, NULL, 10);
+            if (parsedRate >= 8000 && parsedRate <= 192000)
+                config->audioSampleRate = (int)parsedRate;
+        }
+        else if (SDL_strcasecmp(key, "audio_buffer_samples") == 0)
+        {
+            unsigned int parsedSamples = (unsigned int)strtoul(value, NULL, 10);
+            if (parsedSamples >= 128 && parsedSamples <= 8192)
+                config->audioBufferSamples = parsedSamples;
+        }
+        else if (SDL_strcasecmp(key, "audio_volume") == 0)
+        {
+            float parsedVolume = strtof(value, NULL);
+            if (parsedVolume >= 0.0f && parsedVolume <= 4.0f)
+                config->audioVolume = parsedVolume;
+        }
+    }
+
+    fclose(file);
 }
 
 void VBlankIntrWait(void)
@@ -479,6 +1199,219 @@ static void UpdateInternalClock(void)
     internalClock.hour = BinToBcd(time->tm_hour);
     internalClock.minute = BinToBcd(time->tm_min);
     internalClock.second = BinToBcd(time->tm_sec);
+}
+
+static void ShowVolumeNotice(float volume)
+{
+    int percent = (int)(volume * 100.0f + 0.5f);
+
+    if (percent < 0)
+        percent = 0;
+    if (percent > 400)
+        percent = 400;
+
+    SDL_snprintf(volumeNoticeText, sizeof(volumeNoticeText), "VOL %d%%", percent);
+    volumeNoticeUntil = SDL_GetTicks() + 1500;
+    showVolumeNotice = true;
+
+    SDL_SetWindowTitle(sdlWindow, volumeNoticeText);
+}
+
+static void AdjustAudioVolume(float delta)
+{
+    float newVolume = audioVolume + delta;
+
+    if (newVolume < 0.0f)
+        newVolume = 0.0f;
+    if (newVolume > 4.0f)
+        newVolume = 4.0f;
+
+    audioVolume = newVolume;
+    ShowVolumeNotice(audioVolume);
+}
+
+static void DrawOverlayBox(uint16_t *pixels, int x, int y, int w, int h, uint16_t color)
+{
+    for (int row = 0; row < h; row++)
+    {
+        int py = y + row;
+        if (py < 0 || py >= DISPLAY_HEIGHT)
+            continue;
+
+        for (int col = 0; col < w; col++)
+        {
+            int px = x + col;
+            if (px < 0 || px >= DISPLAY_WIDTH)
+                continue;
+
+            pixels[py * DISPLAY_WIDTH + px] = color;
+        }
+    }
+}
+
+static const uint8_t *GetOverlayGlyph(char ch)
+{
+    switch (ch)
+    {
+    case 'V':
+    {
+        static const uint8_t glyph[] = {0x11, 0x11, 0x11, 0x0A, 0x0A, 0x04, 0x04};
+        return glyph;
+    }
+    case 'O':
+    {
+        static const uint8_t glyph[] = {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E};
+        return glyph;
+    }
+    case 'L':
+    {
+        static const uint8_t glyph[] = {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F};
+        return glyph;
+    }
+    case '+':
+    {
+        static const uint8_t glyph[] = {0x00, 0x04, 0x04, 0x1F, 0x04, 0x04, 0x00};
+        return glyph;
+    }
+    case '-':
+    {
+        static const uint8_t glyph[] = {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00};
+        return glyph;
+    }
+    case '%':
+    {
+        static const uint8_t glyph[] = {0x11, 0x02, 0x04, 0x08, 0x10, 0x11, 0x00};
+        return glyph;
+    }
+    case '0':
+    {
+        static const uint8_t glyph[] = {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E};
+        return glyph;
+    }
+    case '1':
+    {
+        static const uint8_t glyph[] = {0x04, 0x0C, 0x14, 0x04, 0x04, 0x04, 0x1F};
+        return glyph;
+    }
+    case '2':
+    {
+        static const uint8_t glyph[] = {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F};
+        return glyph;
+    }
+    case '3':
+    {
+        static const uint8_t glyph[] = {0x1E, 0x01, 0x01, 0x0E, 0x01, 0x01, 0x1E};
+        return glyph;
+    }
+    case '4':
+    {
+        static const uint8_t glyph[] = {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02};
+        return glyph;
+    }
+    case '5':
+    {
+        static const uint8_t glyph[] = {0x1F, 0x10, 0x10, 0x1E, 0x01, 0x01, 0x1E};
+        return glyph;
+    }
+    case '6':
+    {
+        static const uint8_t glyph[] = {0x0E, 0x10, 0x10, 0x1E, 0x11, 0x11, 0x0E};
+        return glyph;
+    }
+    case '7':
+    {
+        static const uint8_t glyph[] = {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08};
+        return glyph;
+    }
+    case '8':
+    {
+        static const uint8_t glyph[] = {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E};
+        return glyph;
+    }
+    case '9':
+    {
+        static const uint8_t glyph[] = {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x01, 0x0E};
+        return glyph;
+    }
+    case ' ':
+    default:
+    {
+        static const uint8_t glyph[] = {0, 0, 0, 0, 0, 0, 0};
+        return glyph;
+    }
+    }
+}
+
+static void DrawOverlayChar(uint16_t *pixels, int x, int y, char ch, uint16_t color)
+{
+    const uint8_t *glyph = GetOverlayGlyph(ch);
+
+    for (int row = 0; row < 7; row++)
+    {
+        for (int col = 0; col < 5; col++)
+        {
+            if (glyph[row] & (1 << (4 - col)))
+            {
+                int px = x + col;
+                int py = y + row;
+                if (px >= 0 && px < DISPLAY_WIDTH && py >= 0 && py < DISPLAY_HEIGHT)
+                    pixels[py * DISPLAY_WIDTH + px] = color;
+            }
+        }
+    }
+}
+
+static int OverlayTextWidth(const char *text)
+{
+    int length = 0;
+
+    while (text[length] != '\0')
+        length++;
+
+    return (length * 6) - 1;
+}
+
+static void DrawOverlayText(uint16_t *pixels, int x, int y, const char *text, uint16_t color)
+{
+    int cursorX = x;
+
+    for (int i = 0; text[i] != '\0'; i++)
+    {
+        DrawOverlayChar(pixels, cursorX, y, text[i], color);
+        cursorX += 6;
+    }
+}
+
+static void DrawVolumeOverlay(uint16_t *pixels)
+{
+    int boxX;
+    int boxY = 6;
+    int boxW;
+    int boxH = 18;
+    int textX;
+
+    if (!showVolumeNotice)
+        return;
+
+    if (SDL_GetTicks() >= volumeNoticeUntil)
+    {
+        showVolumeNotice = false;
+        return;
+    }
+
+    boxX = 6;
+    boxW = OverlayTextWidth(volumeNoticeText) + 12;
+    if (boxW < 58)
+        boxW = 58;
+
+    DrawOverlayBox(pixels, boxX, boxY, boxW, boxH, RGB555(0, 0, 0));
+    DrawOverlayBox(pixels, boxX, boxY, boxW, 1, RGB555_WHITE);
+    DrawOverlayBox(pixels, boxX, boxY + boxH - 1, boxW, 1, RGB555_WHITE);
+    DrawOverlayBox(pixels, boxX, boxY, 1, boxH, RGB555_WHITE);
+    DrawOverlayBox(pixels, boxX + boxW - 1, boxY, 1, boxH, RGB555_WHITE);
+
+    textX = boxX + 6;
+    DrawOverlayText(pixels, textX, boxY + 4, volumeNoticeText, RGB555_WHITE);
 }
 
 void Platform_GetDateTime(struct SiiRtcInfo *rtc)

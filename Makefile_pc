@@ -70,7 +70,7 @@ ifneq ($(NO_STD_LIB),1)
 endif
 
 ifeq ($(TARGET_PLATFORM), PLATFORM_SDL2)
-	PLATFORM_INCLUDES += -lSDL2main -lSDL2.dll
+	PLATFORM_INCLUDES += -lSDL2main -lSDL2.dll -lopengl32
 endif
 	
 ifeq ($(TARGET_PLATFORM), PLATFORM_WIN32)
