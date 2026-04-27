@@ -7,6 +7,9 @@
 #include <time.h>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <xinput.h>
 #endif
@@ -56,7 +59,15 @@ double fixedTimestep = 1.0 / 60.0; // 16.666667ms
 double timeScale = 1.0;
 GLuint glProgram = 0;
 GLuint glFrameTexture = 0;
+GLuint glPrevFrameTexture = 0;
+GLuint glTopBgTexture = 0;
+GLuint glTopSpriteTexture = 0;
+GLuint glQuadVao = 0;
+GLuint glQuadVbo = 0;
 GLint glMainTextureUniform = -1;
+GLint glPrevFrameTextureUniform = -1;
+GLint glTopBgTextureUniform = -1;
+GLint glTopSpriteTextureUniform = -1;
 GLint glRenderResolutionUniform = -1;
 GLint glSourceResolutionUniform = -1;
 GLint glOutputResolutionUniform = -1;
@@ -102,6 +113,17 @@ static PFNGLUNIFORM1IPROC pglUniform1i;
 static PFNGLUNIFORM1FPROC pglUniform1f;
 static PFNGLUNIFORM2FPROC pglUniform2f;
 static PFNGLACTIVETEXTUREPROC pglActiveTexture;
+static PFNGLGENVERTEXARRAYSPROC pglGenVertexArrays;
+static PFNGLBINDVERTEXARRAYPROC pglBindVertexArray;
+static PFNGLDELETEVERTEXARRAYSPROC pglDeleteVertexArrays;
+static PFNGLGENBUFFERSPROC pglGenBuffers;
+static PFNGLBINDBUFFERPROC pglBindBuffer;
+static PFNGLBUFFERDATAPROC pglBufferData;
+static PFNGLDELETEBUFFERSPROC pglDeleteBuffers;
+static PFNGLVERTEXATTRIBPOINTERPROC pglVertexAttribPointer;
+static PFNGLENABLEVERTEXATTRIBARRAYPROC pglEnableVertexAttribArray;
+typedef void (APIENTRYP PokeGlDrawArraysProc)(GLenum mode, GLint first, GLsizei count);
+static PokeGlDrawArraysProc pglDrawArrays;
 
 static FILE *sSaveFile = NULL;
 
@@ -725,15 +747,40 @@ u16 Platform_GetKeyInput(void)
 void VDraw(SDL_Texture *texture)
 {
     static uint16_t image[DISPLAY_WIDTH * DISPLAY_HEIGHT];
+    static uint16_t previousImage[DISPLAY_WIDTH * DISPLAY_HEIGHT];
+    static uint16_t topBgImage[DISPLAY_WIDTH * DISPLAY_HEIGHT];
+    static uint16_t topSpriteImage[DISPLAY_WIDTH * DISPLAY_HEIGHT];
 
     memset(image, 0, sizeof(image));
+#ifdef RENDERER_EASY_DRAW
+    if (!DrawFrameTopLayers(image, topBgImage, topSpriteImage))
+    {
+        memset(topBgImage, 0, sizeof(topBgImage));
+        memset(topSpriteImage, 0, sizeof(topSpriteImage));
+        DrawFrame(image);
+    }
+#else
+    memset(topBgImage, 0, sizeof(topBgImage));
+    memset(topSpriteImage, 0, sizeof(topSpriteImage));
     DrawFrame(image);
+#endif
     DrawVolumeOverlay(image);
 
     if (useShaderPipeline)
     {
+        glBindTexture(GL_TEXTURE_2D, glPrevFrameTexture);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, previousImage);
+
         glBindTexture(GL_TEXTURE_2D, glFrameTexture);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, image);
+
+        glBindTexture(GL_TEXTURE_2D, glTopBgTexture);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, topBgImage);
+
+        glBindTexture(GL_TEXTURE_2D, glTopSpriteTexture);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, topSpriteImage);
+
+        memcpy(previousImage, image, sizeof(image));
     }
     else
     {
@@ -810,6 +857,16 @@ static bool LoadShaderApi(void)
     pglUniform1f = (PFNGLUNIFORM1FPROC)SDL_GL_GetProcAddress("glUniform1f");
     pglUniform2f = (PFNGLUNIFORM2FPROC)SDL_GL_GetProcAddress("glUniform2f");
     pglActiveTexture = (PFNGLACTIVETEXTUREPROC)SDL_GL_GetProcAddress("glActiveTexture");
+    pglGenVertexArrays = (PFNGLGENVERTEXARRAYSPROC)SDL_GL_GetProcAddress("glGenVertexArrays");
+    pglBindVertexArray = (PFNGLBINDVERTEXARRAYPROC)SDL_GL_GetProcAddress("glBindVertexArray");
+    pglDeleteVertexArrays = (PFNGLDELETEVERTEXARRAYSPROC)SDL_GL_GetProcAddress("glDeleteVertexArrays");
+    pglGenBuffers = (PFNGLGENBUFFERSPROC)SDL_GL_GetProcAddress("glGenBuffers");
+    pglBindBuffer = (PFNGLBINDBUFFERPROC)SDL_GL_GetProcAddress("glBindBuffer");
+    pglBufferData = (PFNGLBUFFERDATAPROC)SDL_GL_GetProcAddress("glBufferData");
+    pglDeleteBuffers = (PFNGLDELETEBUFFERSPROC)SDL_GL_GetProcAddress("glDeleteBuffers");
+    pglVertexAttribPointer = (PFNGLVERTEXATTRIBPOINTERPROC)SDL_GL_GetProcAddress("glVertexAttribPointer");
+    pglEnableVertexAttribArray = (PFNGLENABLEVERTEXATTRIBARRAYPROC)SDL_GL_GetProcAddress("glEnableVertexAttribArray");
+    pglDrawArrays = (PokeGlDrawArraysProc)SDL_GL_GetProcAddress("glDrawArrays");
 
     return pglCreateShader != NULL
         && pglShaderSource != NULL
@@ -828,7 +885,17 @@ static bool LoadShaderApi(void)
         && pglUniform1i != NULL
         && pglUniform1f != NULL
         && pglUniform2f != NULL
-        && pglActiveTexture != NULL;
+        && pglActiveTexture != NULL
+        && pglGenVertexArrays != NULL
+        && pglBindVertexArray != NULL
+        && pglDeleteVertexArrays != NULL
+        && pglGenBuffers != NULL
+        && pglBindBuffer != NULL
+        && pglBufferData != NULL
+        && pglDeleteBuffers != NULL
+        && pglVertexAttribPointer != NULL
+        && pglEnableVertexAttribArray != NULL
+        && pglDrawArrays != NULL;
 }
 
 static GLuint CompileShader(GLenum type, const char *source, const char *label)
@@ -856,13 +923,21 @@ static GLuint CompileShader(GLenum type, const char *source, const char *label)
 static bool TryInitShaderPipeline(void)
 {
     static const char *vertexSource =
-        "#version 120\n"
-        "varying vec2 vTexCoord;\n"
+        "#version 330 core\n"
+        "layout(location = 0) in vec2 aPos;\n"
+        "layout(location = 1) in vec2 aTexCoord;\n"
+        "out vec2 vTexCoord;\n"
         "void main()\n"
         "{\n"
-        "    vTexCoord = gl_MultiTexCoord0.xy;\n"
-        "    gl_Position = gl_Vertex;\n"
+        "    vTexCoord = aTexCoord;\n"
+        "    gl_Position = vec4(aPos, 0.0, 1.0);\n"
         "}\n";
+    static const GLfloat quadVertices[] = {
+        -1.0f, -1.0f, 0.0f, 1.0f,
+         1.0f, -1.0f, 1.0f, 1.0f,
+        -1.0f,  1.0f, 0.0f, 0.0f,
+         1.0f,  1.0f, 1.0f, 0.0f,
+    };
     GLint linkStatus = 0;
     GLuint vertexShader;
     GLuint fragmentShader;
@@ -874,9 +949,9 @@ static bool TryInitShaderPipeline(void)
         return false;
     }
 
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
 
     sdlGlContext = SDL_GL_CreateContext(sdlWindow);
     if (sdlGlContext == NULL)
@@ -938,6 +1013,9 @@ static bool TryInitShaderPipeline(void)
     }
 
     glMainTextureUniform = pglGetUniformLocation(glProgram, "uMainTex");
+    glPrevFrameTextureUniform = pglGetUniformLocation(glProgram, "uPrevFrameTex");
+    glTopBgTextureUniform = pglGetUniformLocation(glProgram, "uTopBgTex");
+    glTopSpriteTextureUniform = pglGetUniformLocation(glProgram, "uTopSpriteTex");
     glRenderResolutionUniform = pglGetUniformLocation(glProgram, "uRenderResolution");
     glSourceResolutionUniform = pglGetUniformLocation(glProgram, "uSourceResolution");
     glOutputResolutionUniform = pglGetUniformLocation(glProgram, "uOutputResolution");
@@ -947,8 +1025,44 @@ static bool TryInitShaderPipeline(void)
     glAudioVolumeUniform = pglGetUniformLocation(glProgram, "uAudioVolume");
     glSpeedUniform = pglGetUniformLocation(glProgram, "uSpeed");
 
+    pglGenVertexArrays(1, &glQuadVao);
+    pglBindVertexArray(glQuadVao);
+    pglGenBuffers(1, &glQuadVbo);
+    pglBindBuffer(GL_ARRAY_BUFFER, glQuadVbo);
+    pglBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), quadVertices, GL_STATIC_DRAW);
+    pglEnableVertexAttribArray(0);
+    pglVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (const void *)0);
+    pglEnableVertexAttribArray(1);
+    pglVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), (const void *)(2 * sizeof(GLfloat)));
+    pglBindBuffer(GL_ARRAY_BUFFER, 0);
+    pglBindVertexArray(0);
+
     glGenTextures(1, &glFrameTexture);
     glBindTexture(GL_TEXTURE_2D, glFrameTexture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB5_A1, DISPLAY_WIDTH, DISPLAY_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, NULL);
+
+    glGenTextures(1, &glPrevFrameTexture);
+    glBindTexture(GL_TEXTURE_2D, glPrevFrameTexture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB5_A1, DISPLAY_WIDTH, DISPLAY_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, NULL);
+
+    glGenTextures(1, &glTopBgTexture);
+    glBindTexture(GL_TEXTURE_2D, glTopBgTexture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB5_A1, DISPLAY_WIDTH, DISPLAY_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, NULL);
+
+    glGenTextures(1, &glTopSpriteTexture);
+    glBindTexture(GL_TEXTURE_2D, glTopSpriteTexture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -959,6 +1073,12 @@ static bool TryInitShaderPipeline(void)
     {
         pglUseProgram(glProgram);
         pglUniform1i(glMainTextureUniform, 0);
+        if (glPrevFrameTextureUniform >= 0)
+            pglUniform1i(glPrevFrameTextureUniform, 1);
+        if (glTopBgTextureUniform >= 0)
+            pglUniform1i(glTopBgTextureUniform, 2);
+        if (glTopSpriteTextureUniform >= 0)
+            pglUniform1i(glTopSpriteTextureUniform, 3);
         pglUseProgram(0);
     }
 
@@ -985,6 +1105,12 @@ static void RenderFrameWithShader(void)
     pglUseProgram(glProgram);
     pglActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, glFrameTexture);
+    pglActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, glPrevFrameTexture);
+    pglActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, glTopBgTexture);
+    pglActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, glTopSpriteTexture);
 
     scaleX = (float)windowW / (float)DISPLAY_WIDTH;
     scaleY = (float)windowH / (float)DISPLAY_HEIGHT;
@@ -1006,15 +1132,11 @@ static void RenderFrameWithShader(void)
         pglUniform1f(glAudioVolumeUniform, audioVolume);
     if (glSpeedUniform >= 0)
         pglUniform1f(glSpeedUniform, (float)timeScale);
-
-    glEnable(GL_TEXTURE_2D);
-    glBegin(GL_QUADS);
-    glTexCoord2f(0.0f, 1.0f); glVertex2f(-1.0f, -1.0f);
-    glTexCoord2f(1.0f, 1.0f); glVertex2f(1.0f, -1.0f);
-    glTexCoord2f(1.0f, 0.0f); glVertex2f(1.0f, 1.0f);
-    glTexCoord2f(0.0f, 0.0f); glVertex2f(-1.0f, 1.0f);
-    glEnd();
-    glDisable(GL_TEXTURE_2D);
+    
+    pglBindVertexArray(glQuadVao);
+    pglDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    pglBindVertexArray(0);
+    pglActiveTexture(GL_TEXTURE0);
 
     pglUseProgram(0);
     shaderFrameCounter++;
@@ -1022,6 +1144,36 @@ static void RenderFrameWithShader(void)
 
 static void ShutdownShaderPipeline(void)
 {
+    if (glQuadVbo != 0)
+    {
+        pglDeleteBuffers(1, &glQuadVbo);
+        glQuadVbo = 0;
+    }
+
+    if (glQuadVao != 0)
+    {
+        pglDeleteVertexArrays(1, &glQuadVao);
+        glQuadVao = 0;
+    }
+
+    if (glTopSpriteTexture != 0)
+    {
+        glDeleteTextures(1, &glTopSpriteTexture);
+        glTopSpriteTexture = 0;
+    }
+
+    if (glTopBgTexture != 0)
+    {
+        glDeleteTextures(1, &glTopBgTexture);
+        glTopBgTexture = 0;
+    }
+
+    if (glPrevFrameTexture != 0)
+    {
+        glDeleteTextures(1, &glPrevFrameTexture);
+        glPrevFrameTexture = 0;
+    }
+
     if (glFrameTexture != 0)
     {
         glDeleteTextures(1, &glFrameTexture);
@@ -1035,6 +1187,9 @@ static void ShutdownShaderPipeline(void)
     }
 
     glMainTextureUniform = -1;
+    glPrevFrameTextureUniform = -1;
+    glTopBgTextureUniform = -1;
+    glTopSpriteTextureUniform = -1;
     glRenderResolutionUniform = -1;
     glSourceResolutionUniform = -1;
     glOutputResolutionUniform = -1;

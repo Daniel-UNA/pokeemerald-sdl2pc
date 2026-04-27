@@ -28,6 +28,8 @@
 
 extern void (*const gIntrTable[])(void);
 
+void DrawFrame(uint16_t *pixels);
+
 struct scanlineData {
     uint16_t layers[4][DISPLAY_WIDTH];
     uint16_t spriteLayers[4][DISPLAY_WIDTH];
@@ -669,7 +671,7 @@ static void DrawSprites(struct scanlineData* scanline, uint16_t vcount, bool win
     }
 }
 
-static void DrawScanline(uint16_t *pixels, uint16_t vcount)
+static void DrawScanline(uint16_t *pixels, uint16_t *topBgPixels, uint16_t *topSpritePixels, uint16_t vcount)
 {
     unsigned int mode = REG_DISPCNT & 3;
     unsigned char numOfBgs = (mode == 0 ? 4 : 3);
@@ -861,6 +863,8 @@ static void DrawScanline(uint16_t *pixels, uint16_t vcount)
                     }
                     //write the pixel to scanline buffer output
                     pixels[xpos] = color;
+                    if (topBgPixels != NULL)
+                        topBgPixels[xpos] = color;
                 }
             }
         }
@@ -875,6 +879,8 @@ static void DrawScanline(uint16_t *pixels, uint16_t vcount)
                         continue;
                 //draw the pixel
                 pixels[xpos] = src[xpos];
+                if (topSpritePixels != NULL)
+                    topSpritePixels[xpos] = src[xpos];
             }
         }
     }
@@ -888,10 +894,104 @@ uint16_t *memsetu16(uint16_t *dst, uint16_t fill, size_t count)
     }
 }
 
+bool CopyFrameRegion(const uint16_t *sourcePixels, uint16_t *destPixels, int destStridePixels, int srcX, int srcY, int width, int height)
+{
+    if (sourcePixels == NULL || destPixels == NULL)
+        return false;
+    if (width <= 0 || height <= 0 || destStridePixels < width)
+        return false;
+    if (srcX < 0 || srcY < 0)
+        return false;
+    if (srcX >= DISPLAY_WIDTH || srcY >= DISPLAY_HEIGHT)
+        return false;
+
+    if (srcX + width > DISPLAY_WIDTH)
+        width = DISPLAY_WIDTH - srcX;
+    if (srcY + height > DISPLAY_HEIGHT)
+        height = DISPLAY_HEIGHT - srcY;
+
+    for (int y = 0; y < height; y++)
+    {
+        const uint16_t *srcLine = &sourcePixels[(srcY + y) * DISPLAY_WIDTH + srcX];
+        uint16_t *dstLine = &destPixels[y * destStridePixels];
+
+        for (int x = 0; x < width; x++)
+            dstLine[x] = srcLine[x];
+    }
+
+    return true;
+}
+
+bool DrawFrameRegion(uint16_t *destPixels, int destStridePixels, int srcX, int srcY, int width, int height)
+{
+    static uint16_t fullFrame[DISPLAY_WIDTH * DISPLAY_HEIGHT];
+
+    DrawFrame(fullFrame);
+    return CopyFrameRegion(fullFrame, destPixels, destStridePixels, srcX, srcY, width, height);
+}
+
+bool DrawFrameTopLayers(uint16_t *framePixels, uint16_t *topBgPixels, uint16_t *topSpritePixels)
+{
+    if (framePixels == NULL)
+        return false;
+
+    for (int i = 0; i < DISPLAY_HEIGHT; i++)
+    {
+        uint16_t *frameLine = &framePixels[i * DISPLAY_WIDTH];
+        uint16_t *bgLine = (topBgPixels != NULL) ? &topBgPixels[i * DISPLAY_WIDTH] : NULL;
+        uint16_t *spriteLine = (topSpritePixels != NULL) ? &topSpritePixels[i * DISPLAY_WIDTH] : NULL;
+
+        if (bgLine != NULL)
+            memsetu16(bgLine, *(uint16_t *)PLTT, DISPLAY_WIDTH);
+        if (spriteLine != NULL)
+            memsetu16(spriteLine, 0, DISPLAY_WIDTH);
+
+        REG_VCOUNT = i;
+        if (((REG_DISPSTAT >> 8) & 0xFF) == REG_VCOUNT)
+        {
+            REG_DISPSTAT |= INTR_FLAG_VCOUNT;
+            if (REG_DISPSTAT & DISPSTAT_VCOUNT_INTR)
+                gIntrTable[0]();
+        }
+
+        // Render the backdrop color before each individual scanline.
+        unsigned int blendMode = (REG_BLDCNT >> 6) & 3;
+        uint16_t backdropColor = *(uint16_t *)PLTT;
+        if (REG_BLDCNT & BLDCNT_TGT1_BD)
+        {
+            switch (blendMode)
+            {
+            case 2:
+                backdropColor = alphaBrightnessIncrease(backdropColor);
+                break;
+            case 3:
+                backdropColor = alphaBrightnessDecrease(backdropColor);
+                break;
+            }
+        }
+
+        memsetu16(frameLine, backdropColor, DISPLAY_WIDTH);
+        if (bgLine != NULL)
+            memsetu16(bgLine, backdropColor, DISPLAY_WIDTH);
+
+        DrawScanline(frameLine, bgLine, spriteLine, i);
+
+        REG_DISPSTAT |= INTR_FLAG_HBLANK;
+        RunDMAs(DMA_HBLANK);
+
+        if (REG_DISPSTAT & DISPSTAT_HBLANK_INTR)
+            gIntrTable[3]();
+
+        REG_DISPSTAT &= ~INTR_FLAG_HBLANK;
+        REG_DISPSTAT &= ~INTR_FLAG_VCOUNT;
+    }
+
+    return true;
+}
+
 void DrawFrame(uint16_t *pixels)
 {
     int i;
-    int j;
 
     for (i = 0; i < DISPLAY_HEIGHT; i++)
     {
@@ -921,7 +1021,7 @@ void DrawFrame(uint16_t *pixels)
         }
 
         memsetu16(&pixels[i * DISPLAY_WIDTH], backdropColor, DISPLAY_WIDTH);
-        DrawScanline(&pixels[i * DISPLAY_WIDTH], i);
+        DrawScanline(&pixels[i * DISPLAY_WIDTH], NULL, NULL, i);
         
         REG_DISPSTAT |= INTR_FLAG_HBLANK;
 
